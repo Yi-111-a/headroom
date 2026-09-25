@@ -408,6 +408,22 @@ class StreamingMixin:
         cannot replay; anything else returns None so the caller can fail
         loudly instead.
         """
+        if provider == "anthropic":
+            # Keep the complete wire envelope alongside the mutable message
+            # view. Callers that need to render a changed response own this
+            # envelope in their request-local flow; never attach it to this
+            # shared handler instance.
+            from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
+
+            envelope = AnthropicSSEEnvelope.parse(sse_data.encode("utf-8"))
+            if require_complete and not envelope.is_complete():
+                return None
+            return (
+                envelope.message
+                if envelope.message.get("content") or envelope.saw_message_start
+                else None
+            )
+
         if provider != "anthropic":
             return None  # Only implemented for Anthropic
 
@@ -643,17 +659,16 @@ class StreamingMixin:
         events: list[bytes] = []
 
         # message_start
+        message_fields = {key: value for key, value in response.items() if key != "content"}
+        message_fields.setdefault("type", "message")
+        message_fields.setdefault("role", "assistant")
+        message_fields.setdefault("model", "unknown")
+        message_fields.setdefault("stop_reason", None)
+        message_fields["id"] = response.get("id", message_fields.get("id", "msg_generated"))
+        message_fields["usage"] = response.get("usage", {})
         msg_start = {
             "type": "message_start",
-            "message": {
-                "id": response.get("id", "msg_generated"),
-                "type": "message",
-                "role": response.get("role", "assistant"),
-                "model": response.get("model", "unknown"),
-                "content": [],
-                "stop_reason": None,
-                "usage": response.get("usage", {}),
-            },
+            "message": {**message_fields, "content": []},
         }
         events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
 
@@ -1247,6 +1262,7 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
+        from headroom.proxy.anthropic_wire import is_safeguard_capable_request
         from headroom.proxy.body_forwarding import select_outbound_body
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
@@ -1273,8 +1289,14 @@ class StreamingMixin:
             source=outbound_source,
             dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
+        safeguard_capable = provider == "anthropic" and is_safeguard_capable_request(
+            body, headers.get("anthropic-beta")
+        )
         _codex_wire_debug = (
-            codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
+            codex_wire_debug_enabled()
+            and not safeguard_capable
+            and provider == "openai"
+            and "/responses" in url
         )
         if _codex_wire_debug:
             capture_codex_wire_debug(

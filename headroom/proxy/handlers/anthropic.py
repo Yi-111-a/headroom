@@ -31,8 +31,14 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
-from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
+from headroom.copilot_auth import apply_copilot_api_auth
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.proxy.anthropic_wire import (
+    build_anthropic_upstream_url,
+    is_safeguard_capable_request,
+    preserve_opaque_response_fields,
+    strip_safeguard_payload,
+)
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -1064,6 +1070,12 @@ class AnthropicHandlerMixin:
                         },
                     },
                 )
+            # This is a boolean capability classification only.  The
+            # safeguards value itself is never copied into logs, metrics, or
+            # any Headroom-owned state.
+            client_anthropic_version = request.headers.get("anthropic-version")
+            client_anthropic_beta = request.headers.get("anthropic-beta")
+            safeguard_capable_request = is_safeguard_capable_request(body, client_anthropic_beta)
             raw_model = body.get("model") or model_override or "unknown"
             model = (
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
@@ -1614,23 +1626,33 @@ class AnthropicHandlerMixin:
                 log_beta_header_merge,
             )
 
-            _client_beta_value = headers.get("anthropic-beta")
+            _client_beta_value = client_anthropic_beta
             _client_beta_count = (
                 len([t for t in (_client_beta_value or "").split(",") if t.strip()])
                 if _client_beta_value
                 else 0
             )
-            _sticky_beta_value = get_session_beta_tracker().record_and_get_sticky_betas(
-                provider="anthropic",
-                session_id=session_id,
-                client_value=_client_beta_value,
-            )
+            if safeguard_capable_request:
+                # Claude Code's classifier capability is negotiated by the
+                # client-owned header.  Do not let prior turns' sticky beta
+                # state rewrite this turn.
+                _sticky_beta_value = _client_beta_value or ""
+            else:
+                _sticky_beta_value = get_session_beta_tracker().record_and_get_sticky_betas(
+                    provider="anthropic",
+                    session_id=session_id,
+                    client_value=_client_beta_value,
+                )
             _sticky_beta_count = (
                 len([t for t in _sticky_beta_value.split(",") if t.strip()])
                 if _sticky_beta_value
                 else 0
             )
-            if _sticky_beta_value and _sticky_beta_value != (_client_beta_value or ""):
+            if (
+                not safeguard_capable_request
+                and _sticky_beta_value
+                and _sticky_beta_value != (_client_beta_value or "")
+            ):
                 headers["anthropic-beta"] = _sticky_beta_value
             elif not _sticky_beta_value and "anthropic-beta" in headers:
                 # Sticky value can only equal "" when both client and
@@ -2787,6 +2809,11 @@ class AnthropicHandlerMixin:
                                 # need its own merge helper.
                                 headers[key] = value
                                 continue
+                            if safeguard_capable_request:
+                                # Memory may still inject its tools, but it
+                                # must not negotiate a different capability on
+                                # a classifier-bearing turn.
+                                continue
                             existing_value = headers.get(key, "")
                             required_tokens = [t.strip() for t in value.split(",") if t.strip()]
                             _headroom_beta_added = True
@@ -3165,7 +3192,11 @@ class AnthropicHandlerMixin:
                 # client's own tokens — the same reduction the gateway contract
                 # applies before handing ``headers`` to the gateway.
                 _hook_headers = getattr(_req_ctx, "provider_headers", None)
-                if isinstance(_hook_headers, dict) and _hook_headers:
+                if (
+                    isinstance(_hook_headers, dict)
+                    and _hook_headers
+                    and not safeguard_capable_request
+                ):
                     from headroom.proxy.turn_hooks import merge_provider_headers
 
                     for _hh_key, _hh_value in merge_provider_headers(
@@ -3417,6 +3448,18 @@ class AnthropicHandlerMixin:
                 except (json.JSONDecodeError, ValueError, MemoryError, RecursionError):
                     body_mutation_tracker.mark_mutated("original_unparseable")
 
+            if safeguard_capable_request:
+                # Restore the exact client-owned capability headers after all
+                # pipeline, memory, and hook stages.  Header names are
+                # case-insensitive; values are not normalized or merged.
+                for key in list(headers):
+                    if key.lower() in {"anthropic-version", "anthropic-beta"}:
+                        headers.pop(key, None)
+                if client_anthropic_version is not None:
+                    headers["anthropic-version"] = client_anthropic_version
+                if client_anthropic_beta is not None:
+                    headers["anthropic-beta"] = client_anthropic_beta
+
             if (
                 (upstream_base_url or self.ANTHROPIC_API_URL != "https://api.anthropic.com")
                 and stream
@@ -3483,7 +3526,7 @@ class AnthropicHandlerMixin:
                             model=model,
                             messages=body["messages"],
                             tools=tools,
-                            response=backend_response.body,
+                            response=(None if safeguard_capable_request else backend_response.body),
                             metadata={
                                 "path": pipeline_path,
                                 "stream": False,
@@ -3496,7 +3539,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             provider=pipeline_provider,
                             model=model,
-                            response=backend_response.body,
+                            response=(None if safeguard_capable_request else backend_response.body),
                             metadata={
                                 "path": pipeline_path,
                                 "stream": False,
@@ -3694,13 +3737,11 @@ class AnthropicHandlerMixin:
             # every one of those turns to "anthropic" on the dashboard.
             # For a non-Copilot base the builder only joins base + path, so the
             # URL itself is unchanged.
-            url = (
-                build_copilot_upstream_url(upstream_base_url, request.url.path)
-                if upstream_base_url
-                else build_copilot_upstream_url(self.ANTHROPIC_API_URL, "/v1/messages")
+            url = build_anthropic_upstream_url(
+                upstream_base_url or self.ANTHROPIC_API_URL,
+                request.url.path,
+                request.url.query,
             )
-            if upstream_base_url and request.url.query:
-                url = f"{url}?{request.url.query}"
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
@@ -4003,7 +4044,7 @@ class AnthropicHandlerMixin:
                             model=model,
                             messages=body["messages"],
                             tools=tools,
-                            response=response,
+                            response=(None if safeguard_capable_request else response),
                             metadata={
                                 "path": pipeline_path,
                                 "stream": False,
@@ -4018,7 +4059,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             provider=pipeline_provider,
                             model=model,
-                            response=response,
+                            response=(None if safeguard_capable_request else response),
                             metadata={
                                 "path": pipeline_path,
                                 "stream": False,
@@ -4042,11 +4083,21 @@ class AnthropicHandlerMixin:
                         if response.status_code >= 400:
                             try:
                                 err_body = response.json()
+                                if safeguard_capable_request:
+                                    err_body = strip_safeguard_payload(err_body)
                                 err_msg = err_body.get("error", {}).get("message", "")
                                 err_type = err_body.get("error", {}).get("type", "")
                             except Exception:
-                                err_body = {"raw": response.text[:2000]}
-                                err_msg = str(response.text[:500])
+                                err_body = (
+                                    {"raw": "<redacted classifier-bearing upstream error>"}
+                                    if safeguard_capable_request
+                                    else {"raw": response.text[:2000]}
+                                )
+                                err_msg = (
+                                    "<redacted classifier-bearing upstream error>"
+                                    if safeguard_capable_request
+                                    else str(response.text[:500])
+                                )
                                 err_type = "parse_error"
 
                             logger.warning(
@@ -4316,6 +4367,9 @@ class AnthropicHandlerMixin:
                                     tools,
                                     api_call_fn,
                                     provider="anthropic",
+                                )
+                                final_resp_json = preserve_opaque_response_fields(
+                                    resp_json, final_resp_json
                                 )
                                 # Update response content with final response
                                 resp_json = final_resp_json
