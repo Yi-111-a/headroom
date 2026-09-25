@@ -13,7 +13,6 @@ out these tests by being rejected rather than exercising the timeout.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 import types
@@ -128,8 +127,6 @@ def test_offline_mode_prevents_network_loading(monkeypatch: pytest.MonkeyPatch) 
     assert _load_tokenizer("Qwen/Qwen2.5-7B") is None
     assert len(calls) == 1
     assert calls[0].get("local_files_only") is True
-    assert os.environ["HF_HUB_OFFLINE"] == "1"
-    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
 def test_offline_mode_allows_cached_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:

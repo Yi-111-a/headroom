@@ -226,12 +226,11 @@ def _load_tokenizer(tokenizer_name: str):
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
 
-    from headroom.offline import is_offline
+    from headroom.offline import apply_offline_env, is_offline
 
     offline = is_offline()
     if offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        apply_offline_env()
 
     from transformers import AutoTokenizer
 
