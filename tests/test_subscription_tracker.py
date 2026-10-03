@@ -184,8 +184,8 @@ async def test_maybe_poll_prefers_refreshed_credentials_token_over_stale_header(
     permanent `poll_errors` and a `polled_at` that never advanced."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    # Token captured from a proxied request, before Claude Code rotated it.
-    tracker.notify_active("Bearer stale-header-token")
+    # Token captured from a proxied local-operator request, before Claude Code rotated it.
+    tracker.notify_active("Bearer stale-header-token", from_local_operator=True)
 
     monkeypatch.setattr(
         "headroom.subscription.client.read_cached_oauth_token", lambda: "refreshed-file-token"
@@ -221,7 +221,7 @@ async def test_maybe_poll_falls_back_to_header_token_when_file_token_rejected(
     it rather than mark the tracker errored."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer header-only-token")
+    tracker.notify_active("Bearer header-only-token", from_local_operator=True)
 
     monkeypatch.setattr(
         "headroom.subscription.client.read_cached_oauth_token", lambda: "revoked-file-token"
@@ -254,7 +254,7 @@ async def test_maybe_poll_single_request_when_file_token_matches_header(
     session whose credentials file holds the same token as the header."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer shared-token")
+    tracker.notify_active("Bearer shared-token", from_local_operator=True)
 
     monkeypatch.setattr(
         "headroom.subscription.client.read_cached_oauth_token", lambda: "shared-token"
@@ -281,6 +281,9 @@ async def test_maybe_poll_success_updates_state_and_metrics(
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
     tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    # Pin the credentials-file/env source so this exercises the adopted
+    # local-operator header path, not whatever token the host happens to hold.
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
     discrepancies = [WindowDiscrepancy(kind="cache_miss", description="miss", severity="warning")]
@@ -327,6 +330,7 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
     tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
 
