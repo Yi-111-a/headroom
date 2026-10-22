@@ -171,40 +171,38 @@ class SQLiteBackend:
             self._conn.close()
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
+        # Remove the corrupt database's -wal / -shm sidecars while the main
+        # file still exists, so no sibling worker can have created a fresh
+        # database (and fresh sidecars) at this path yet.
+        for suffix in ("-wal", "-shm"):
+            try:
+                Path(f"{self._path}{suffix}").unlink(missing_ok=True)
+            except OSError:  # noqa: PERF203 - best-effort sidecar cleanup
+                pass
         try:
             self._path.unlink(missing_ok=True)
         except PermissionError:
-            # On Windows another process may hold the file open; do not fight
-            # it.  Leaving the database intact is safer than risking data loss.
+            # On Windows another process may still hold the file open. Leave
+            # it in place and reattach to it instead of keeping a closed
+            # handle, so later operations are not silently dead.
             logger.warning(
-                "CCR SQLite could not unlink %s (PermissionError); "
-                "treating error as transient.",
+                "CCR SQLite could not remove corrupt store %s (PermissionError); "
+                "reattaching to the existing file.",
                 self._path,
             )
-            self._unreadable_warned = WarnOnce(
-                _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
-            )
-            return
-        # Remove sidecar files (‑wal, ‑shm) alongside the main database file.
-        for suffix in ("", "-wal", "-shm"):
-            p = Path(str(self._path) + suffix)
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        try:
-            self._conn = self._open()
-        except Exception:
-            # If recreation fails, leave the connection in its current state.
-            # Callers catch DatabaseError and treat the operation as a miss.
-            logger.error(
-                "CCR SQLite failed to recreate connection at %s after corruption recovery", self._path
-            )
-            return
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
+        try:
+            self._conn = self._open()
+        except Exception:  # noqa: BLE001 - recovery must not escape get()/set()
+            # Leave the closed handle in place: later operations raise
+            # ProgrammingError (a DatabaseError) and are treated as misses.
+            logger.exception(
+                "CCR SQLite failed to reopen %s after corruption recovery; "
+                "the store is unavailable until the process restarts.",
+                self._path,
+            )
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
         first = self._unreadable_warned.first(hash_key, logger)
