@@ -171,11 +171,40 @@ class SQLiteBackend:
             self._conn.close()
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
-        self._path.unlink(missing_ok=True)
+        try:
+            self._path.unlink(missing_ok=True)
+        except PermissionError:
+            # On Windows another process may hold the file open; do not fight
+            # it.  Leaving the database intact is safer than risking data loss.
+            logger.warning(
+                "CCR SQLite could not unlink %s (PermissionError); "
+                "treating error as transient.",
+                self._path,
+            )
+            self._unreadable_warned = WarnOnce(
+                _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
+            )
+            return
+        # Remove sidecar files (‑wal, ‑shm) alongside the main database file.
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(self._path) + suffix)
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        try:
+            self._conn = self._open()
+        except Exception:
+            # If recreation fails, leave the connection in its current state.
+            # Callers catch DatabaseError and treat the operation as a miss.
+            logger.error(
+                "CCR SQLite failed to recreate connection at %s after corruption recovery", self._path
+            )
+            return
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        self._conn = self._open()
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
         first = self._unreadable_warned.first(hash_key, logger)
