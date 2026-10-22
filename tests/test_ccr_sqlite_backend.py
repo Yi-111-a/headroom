@@ -425,6 +425,49 @@ class TestMultiWorkerSafety:
         b.set("h2", make_entry("h2"))
         assert b.exists("h2")
 
+    def test_corruption_reset_removes_stale_sidecars(self, db_path):
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        b._conn.close()
+        for suffix in ("-wal", "-shm"):
+            (db_path.parent / f"{db_path.name}{suffix}").write_bytes(b"stale")
+        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+        assert b.count() == 0
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.parent / f"{db_path.name}{suffix}"
+            assert not sidecar.exists() or sidecar.read_bytes() != b"stale"
+
+    def test_corruption_reset_reattaches_when_unlink_is_denied(self, db_path, monkeypatch):
+        """Windows refuses to unlink a file another process holds open; the
+        handler must not raise and must not leave a closed connection."""
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        real_unlink = type(db_path).unlink
+
+        def deny_main(self, *args, **kwargs):
+            if self == db_path:
+                raise PermissionError("[WinError 32] file in use")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(db_path), "unlink", deny_main)
+        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        assert db_path.exists()
+        b.set("h2", make_entry("h2"))
+        assert b.exists("h2")
+
+    def test_failed_reopen_after_reset_does_not_escape(self, db_path, monkeypatch, caplog):
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+
+        def broken_open():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(b, "_open", broken_open)
+        with caplog.at_level(logging.ERROR):
+            b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        assert "failed to reopen" in caplog.text
+        assert b.get("h1") is None  # treated as a miss, not a crash
+
     def test_busy_timeout_configured(self, db_path):
         b = SQLiteBackend(db_path)
         timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
