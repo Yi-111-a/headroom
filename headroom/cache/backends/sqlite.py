@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
 from ...log_safety import WarnOnce, safe_id
-from .base import StoreWriteError
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -159,8 +158,8 @@ class SQLiteBackend:
         """Return the live connection, reopening it if a retry is due.
 
         Caller holds ``_lock``. Raises :class:`StoreUnavailableError` while the
-        store is down, so reads degrade to a miss and ``set()`` raises
-        :class:`StoreWriteError` to the producer.
+        store is down: reads degrade to a miss and ``set()`` returns ``False``
+        to the producer.
         """
         if self._conn is not None:
             return self._conn
@@ -195,9 +194,8 @@ class SQLiteBackend:
         return "malformed" in msg or "not a database" in msg
 
     def _handle_db_error(self, error: sqlite3.DatabaseError, op: str) -> None:
-        """Corruption → recreate (loud). Anything else (busy/locked/io) →
-        log and treat the operation as a miss; never destroy data over a
-        transient error."""
+        """Corruption → fail closed (loud). Anything else (busy/locked/io) →
+        log and treat the operation as a miss; never destroy data."""
         if isinstance(error, StoreUnavailableError):
             logger.warning(
                 "CCR SQLite %s skipped: %s (nothing was read or persisted; "
@@ -212,9 +210,14 @@ class SQLiteBackend:
             )
             return
         logger.warning(
-            "CCR SQLite store at %s is corrupt (%s); recreating. "
-            "Previously stored originals are lost — affected retrieval "
-            "markers will miss until their content is re-compressed.",
+            "CCR SQLite store at %s is corrupt (%s); going offline without "
+            "touching the file. The database and its -wal/-shm sidecars are "
+            "preserved for offline recovery: sibling workers may still hold "
+            "live handles, so an online recreate would split-brain their "
+            "reads/writes or discard committed originals from old WAL state. "
+            "A later operation retries the connection after the backoff; the "
+            "retry succeeds once the file has been repaired or removed offline. "
+            "Until then nothing is read or persisted through this instance.",
             self._path,
             error,
         )
@@ -224,42 +227,14 @@ class SQLiteBackend:
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
         self._conn = None
-        # Remove the corrupt database's -wal / -shm sidecars while the main
-        # file still exists, so no sibling worker can have created a fresh
-        # database (and fresh sidecars) at this path yet.
-        for suffix in ("-wal", "-shm"):
-            try:
-                Path(f"{self._path}{suffix}").unlink(missing_ok=True)
-            except OSError:  # noqa: PERF203 - best-effort sidecar cleanup
-                pass
-        try:
-            self._path.unlink(missing_ok=True)
-        except PermissionError:
-            # On Windows another process may still hold the file open. Leave
-            # it in place and reattach to it instead of keeping a closed
-            # handle, so later operations are not silently dead.
-            logger.warning(
-                "CCR SQLite could not remove corrupt store %s (PermissionError); "
-                "reattaching to the existing file.",
-                self._path,
-            )
         self._unreadable_warned = WarnOnce(
             _MAX_REPORTED_UNREADABLE, "unreadable CCR SQLite entries"
         )
-        try:
-            self._conn = self._open()
-        except Exception:  # noqa: BLE001 - recovery must not escape get()/set()
-            # Keep no handle and schedule a bounded retry: later operations
-            # reopen once it is due instead of failing for the process lifetime.
-            self._schedule_reopen(time.monotonic())
-            logger.exception(
-                "CCR SQLite failed to reopen %s after corruption recovery; "
-                "operations miss until a later reopen succeeds.",
-                self._path,
-            )
-        else:
-            self._reopen_backoff = _REOPEN_BACKOFF_INITIAL
-            self._next_reopen_at = 0.0
+        # Reopen on the next operation once the backoff allows it. Reopening a
+        # still-corrupt file raises again inside ``_open()`` (schema run hits
+        # the corruption), which re-enters the fail-closed state; recovery is
+        # always offline, by the operator.
+        self._schedule_reopen(time.monotonic())
 
     def _report_unreadable(self, hash_key: str, reason: object) -> None:
         first = self._unreadable_warned.first(hash_key, logger)
@@ -336,12 +311,13 @@ class SQLiteBackend:
             return None
         return self._entry_from_json(row[0], hash_key)
 
-    def set(self, hash_key: str, entry: CompressionEntry) -> None:
-        """Persist ``entry``; raise :class:`StoreWriteError` if it was not.
+    def set(self, hash_key: str, entry: CompressionEntry) -> bool | None:
+        """Persist ``entry``; return ``False`` if it was not.
 
         Unlike reads, a failed write must not look like success: the caller
         is about to hand out ``hash_key`` in place of the original, so it has
         to learn that the original is not retrievable and keep it instead.
+        ``CompressionStore.store`` turns the ``False`` into ``StorageError``.
         """
         payload = json.dumps(asdict(entry), ensure_ascii=False)
         with self._lock:
@@ -355,18 +331,27 @@ class SQLiteBackend:
                 conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, f"set {safe_id(hash_key)}")
-                raise StoreWriteError(
-                    f"CCR SQLite write of {safe_id(hash_key)} was not persisted"
-                ) from e
+                logger.warning(
+                    "CCR SQLite write of %s was not persisted; the producer "
+                    "must keep the original content",
+                    safe_id(hash_key),
+                )
+                return False
             try:
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "purge")
                 if self._is_corruption(e):
-                    # Recovery recreated the file, so the row committed above is gone.
-                    raise StoreWriteError(
-                        f"CCR SQLite write of {safe_id(hash_key)} was lost to corruption recovery"
-                    ) from e
+                    # The store went offline mid-write; whether the row just
+                    # committed is still readable is unknown, so report the
+                    # write as lost rather than hand out its hash.
+                    logger.warning(
+                        "CCR SQLite write of %s was lost when the store went "
+                        "offline during the post-write purge",
+                        safe_id(hash_key),
+                    )
+                    return False
+        return True
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:

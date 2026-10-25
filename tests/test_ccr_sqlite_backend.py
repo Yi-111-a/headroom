@@ -14,9 +14,9 @@ import time
 
 import pytest
 
-from headroom.cache.backends.base import StoreWriteError
 from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.exceptions import StorageError
 
 
 def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
@@ -417,47 +417,74 @@ class TestMultiWorkerSafety:
         assert db_path.exists()
         assert b.get("h1") is not None
 
-    def test_corruption_message_triggers_reset(self, db_path):
+    def test_corruption_fails_closed_and_siblings_keep_the_data(self, db_path):
+        """Corruption recovery must not destroy anything online: a sibling
+        worker may still hold live handles, so deleting the main file or its
+        -wal/-shm sidecars would split-brain the sibling or discard committed
+        originals. Fail closed instead — this instance goes offline, the file
+        survives for offline repair, and siblings are unaffected."""
         b = SQLiteBackend(db_path)
-        b.set("h1", make_entry())
-        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
-        # Database recreated: empty but functional.
-        assert b.count() == 0
-        b.set("h2", make_entry("h2"))
-        assert b.exists("h2")
+        assert b.set("h1", make_entry()) is True
+        sibling = SQLiteBackend(db_path)
+        assert sibling.set("h2", make_entry("h2")) is True
 
-    def test_corruption_reset_removes_stale_sidecars(self, db_path):
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        # Same monotonic clock monkey as the recover tests below use; the
+        # reconnect retry follows the shared bounded backoff.
+        clock = [1000.0]
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
+        try:
+            b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+            # Nothing was deleted: main file and every sidecar survive.
+            assert db_path.exists()
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path.parent / f"{db_path.name}{suffix}"
+                assert sidecar.exists()
+            # This instance is down: reads miss, writes are refused loudly.
+            assert b.get("h1") is None
+            assert b.set("h3", make_entry("h3")) is False
+            # The sibling, still connected to the preserved file, keeps serving
+            # the originals that were stored before the recovery boundary.
+            assert sibling.get("h1") is not None
+            assert sibling.get("h2") is not None
+
+            # Offline repair by the operator removes the corrupt file; once
+            # the retry is due, this instance reconnects to a fresh database.
+            for suffix in ("", "-wal", "-shm"):
+                p = db_path if not suffix else db_path.parent / f"{db_path.name}{suffix}"
+                p.unlink(missing_ok=True)
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+            b.set("h4", make_entry("h4"))
+            assert b.get("h4") is not None
+        finally:
+            monkeypatch.undo()
+
+    def test_corruption_recovery_never_unlinks_the_store(self, db_path, monkeypatch):
+        """The recovery path must not delete the main file or any sidecar:
+        sibling workers may still hold live handles, and the survivors are
+        needed for offline repair."""
         b = SQLiteBackend(db_path)
         b.set("h1", make_entry())
-        b._conn.close()
         for suffix in ("-wal", "-shm"):
             (db_path.parent / f"{db_path.name}{suffix}").write_bytes(b"stale")
-        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
-        assert b.count() == 0
-        for suffix in ("-wal", "-shm"):
-            sidecar = db_path.parent / f"{db_path.name}{suffix}"
-            assert not sidecar.exists() or sidecar.read_bytes() != b"stale"
 
-    def test_corruption_reset_reattaches_when_unlink_is_denied(self, db_path, monkeypatch):
-        """Windows refuses to unlink a file another process holds open; the
-        handler must not raise and must not leave a closed connection."""
-        b = SQLiteBackend(db_path)
-        b.set("h1", make_entry())
         real_unlink = type(db_path).unlink
 
-        def deny_main(self, *args, **kwargs):
-            if self == db_path:
-                raise PermissionError("[WinError 32] file in use")
+        def refuse(self, *args, **kwargs):
+            if self.parent == db_path.parent and str(self).startswith(db_path.name):
+                raise AssertionError(
+                    "corruption recovery must not unlink the store or its sidecars"
+                )
             return real_unlink(self, *args, **kwargs)
 
-        monkeypatch.setattr(type(db_path), "unlink", deny_main)
-        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        monkeypatch.setattr(type(db_path), "unlink", refuse)
+        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
         assert db_path.exists()
-        b.set("h2", make_entry("h2"))
-        assert b.exists("h2")
 
-    def test_failed_reopen_after_reset_recovers_later(self, db_path, monkeypatch, caplog):
-        """A reopen that fails during corruption recovery must not leave the
+    def test_failed_reopen_after_recovery_recovers_later(self, db_path, monkeypatch, caplog):
+        """A reopen that fails while the store is offline must not leave the
         store dead for the process lifetime: once the retry is due and the
         open succeeds, writes persist and reads hit again."""
         import headroom.cache.backends.sqlite as sqlite_mod
@@ -474,18 +501,21 @@ class TestMultiWorkerSafety:
         monkeypatch.setattr(b, "_open", broken_open)
         with caplog.at_level(logging.WARNING):
             b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
-            assert "failed to reopen" in caplog.text
-            # Down and the retry is not due yet: a miss, and the discarded
-            # write raises rather than returning as if it had persisted.
+            # Down and the retry is not due yet: a miss, and the refused
+            # write reports False rather than succeeding silently.
             assert b.get("h1") is None
-            with pytest.raises(StoreWriteError):
-                b.set("h2", make_entry("h2"))
+            assert b.set("h2", make_entry("h2")) is False
             assert "nothing was read or persisted" in caplog.text
+
+            # The retry is due but the open still fails: still a miss, and
+            # the next retry is pushed further out.
+            clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
+            assert b.get("h1") is None
 
         # The filesystem problem clears and the backoff elapses.
         monkeypatch.setattr(b, "_open", real_open)
         clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
-        b.set("h3", make_entry("h3"))
+        assert b.set("h3", make_entry("h3")) is True
         got = b.get("h3")
         assert got is not None
         assert got.hash == "h3"
@@ -504,51 +534,50 @@ class TestMultiWorkerSafety:
 
         monkeypatch.setattr(b, "_open", broken_open)
         b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+        assert len(attempts) == 0  # recovery only schedules; no open yet
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None
         assert len(attempts) == 1
         for _ in range(5):
             assert b.get("h1") is None  # not due: no extra open attempts
         assert len(attempts) == 1
         clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
+        assert b.get("h1") is None  # the wait doubled: not due yet
+        assert len(attempts) == 1
+        clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
         assert b.get("h1") is None
         assert len(attempts) == 2
-        # The wait doubled, so the old interval is no longer enough.
+        # The wait doubled again, so one more initial interval is not enough.
         clock[0] += sqlite_mod._REOPEN_BACKOFF_INITIAL
         assert b.get("h1") is None
         assert len(attempts) == 2
 
-    def test_reopen_after_denied_unlink_failure_recovers(self, db_path, monkeypatch):
+    def test_reopen_failure_recovery_ends_the_offline_state(self, db_path, monkeypatch):
         import headroom.cache.backends.sqlite as sqlite_mod
 
         b = SQLiteBackend(db_path)
         b.set("h1", make_entry())
-        real_unlink = type(db_path).unlink
         real_open = b._open
         clock = [1000.0]
         monkeypatch.setattr(sqlite_mod.time, "monotonic", lambda: clock[0])
 
-        def deny_main(self, *args, **kwargs):
-            if self == db_path:
-                raise PermissionError("[WinError 32] file in use")
-            return real_unlink(self, *args, **kwargs)
-
         def broken_open():
             raise sqlite3.OperationalError("unable to open database file")
 
-        monkeypatch.setattr(type(db_path), "unlink", deny_main)
         monkeypatch.setattr(b, "_open", broken_open)
         b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
         assert b.get("h1") is None
 
         monkeypatch.setattr(b, "_open", real_open)
         clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
-        b.set("h2", make_entry("h2"))
+        assert b.set("h2", make_entry("h2")) is True
         assert b.exists("h2")
 
-    def test_transient_write_failure_raises_store_write_error(self, db_path):
+    def test_transient_write_failure_returns_false_and_keeps_the_database(self, db_path):
         """A write lost to a transient error (busy/locked) is still lost:
         set() must report it, and must not reset the database."""
         b = SQLiteBackend(db_path)
-        b.set("h1", make_entry())
+        assert b.set("h1", make_entry()) is True
 
         class LockedInsertConn:
             def __init__(self, real):
@@ -564,9 +593,9 @@ class TestMultiWorkerSafety:
 
         real = b._conn
         b._conn = LockedInsertConn(real)  # type: ignore[assignment]
-        with pytest.raises(StoreWriteError):
-            b.set("h2", make_entry("h2"))
+        assert b.set("h2", make_entry("h2")) is False
         b._conn = real
+        assert db_path.exists()
         assert b.get("h1") is not None
         assert b.get("h2") is None
 
@@ -710,7 +739,7 @@ class TestProducerDuringOutage:
         backend, recover = outage
         store = CompressionStore(backend=backend, enable_feedback=False)
 
-        with pytest.raises(StoreWriteError):
+        with pytest.raises(StorageError):
             store.store("original " * 100, "compressed")
         # Reads stay fail-open: a miss, not an exception.
         assert store.retrieve("0" * 24) is None
@@ -726,8 +755,8 @@ class TestProducerDuringOutage:
         store = CompressionStore(backend=backend, enable_feedback=False)
         hash_key = store.store("original " * 100, "compressed")
 
-        def failing_set(hash_key, entry):
-            raise StoreWriteError("write not persisted")
+        def failing_set(k, entry):
+            return False
 
         backend.set = failing_set  # type: ignore[method-assign]
         entry = store.retrieve(hash_key)
