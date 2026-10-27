@@ -384,6 +384,14 @@ class TestSQLiteBackend:
         assert got.retrieval_count == 1
 
 
+def _close(backend: SQLiteBackend) -> None:
+    """Close a backend's connection, if any (tests only; there is no public close)."""
+    conn = backend._conn
+    backend._conn = None
+    if conn is not None:
+        conn.close()
+
+
 class TestMultiWorkerSafety:
     def test_busy_error_does_not_delete_database(self, db_path):
         """SQLITE_BUSY (OperationalError, a DatabaseError subclass) under
@@ -450,38 +458,57 @@ class TestMultiWorkerSafety:
             assert sibling.get("h1") is not None
             assert sibling.get("h2") is not None
 
-            # Offline repair by the operator removes the corrupt file; once
-            # the retry is due, this instance reconnects to a fresh database.
+            # Offline repair happens with every worker stopped: close the
+            # sibling's handle first (Windows refuses to unlink an open file),
+            # then the operator removes the corrupt file and its sidecars.
+            _close(sibling)
             for suffix in ("", "-wal", "-shm"):
                 p = db_path if not suffix else db_path.parent / f"{db_path.name}{suffix}"
                 p.unlink(missing_ok=True)
+            # Once the retry is due, this instance reconnects to a fresh database.
             clock[0] += sqlite_mod._REOPEN_BACKOFF_MAX
-            b.set("h4", make_entry("h4"))
+            assert b.set("h4", make_entry("h4")) is True
             assert b.get("h4") is not None
         finally:
             monkeypatch.undo()
+            _close(sibling)
+            _close(b)
 
     def test_corruption_recovery_never_unlinks_the_store(self, db_path, monkeypatch):
         """The recovery path must not delete the main file or any sidecar:
         sibling workers may still hold live handles, and the survivors are
         needed for offline repair."""
         b = SQLiteBackend(db_path)
-        b.set("h1", make_entry())
-        for suffix in ("-wal", "-shm"):
-            (db_path.parent / f"{db_path.name}{suffix}").write_bytes(b"stale")
+        # A live sibling keeps the real WAL-mode -wal/-shm sidecars in place;
+        # they are checked as-is rather than overwritten, because the -shm file
+        # is memory-mapped while a connection is open (Windows rejects writes).
+        sibling = SQLiteBackend(db_path)
+        try:
+            assert b.set("h1", make_entry()) is True
+            sidecars = [db_path.parent / f"{db_path.name}{suffix}" for suffix in ("-wal", "-shm")]
+            for sidecar in sidecars:
+                assert sidecar.exists()
 
-        real_unlink = type(db_path).unlink
+            real_unlink = type(db_path).unlink
 
-        def refuse(self, *args, **kwargs):
-            if self.parent == db_path.parent and str(self).startswith(db_path.name):
-                raise AssertionError(
-                    "corruption recovery must not unlink the store or its sidecars"
-                )
-            return real_unlink(self, *args, **kwargs)
+            def refuse(self, *args, **kwargs):
+                if self.parent == db_path.parent and self.name.startswith(db_path.name):
+                    raise AssertionError(
+                        "corruption recovery must not unlink the store or its sidecars"
+                    )
+                return real_unlink(self, *args, **kwargs)
 
-        monkeypatch.setattr(type(db_path), "unlink", refuse)
-        b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
-        assert db_path.exists()
+            monkeypatch.setattr(type(db_path), "unlink", refuse)
+            b._handle_db_error(sqlite3.DatabaseError("file is not a database"), "get")
+            monkeypatch.undo()
+
+            assert db_path.exists()
+            for sidecar in sidecars:
+                assert sidecar.exists()
+            assert sibling.get("h1") is not None
+        finally:
+            _close(sibling)
+            _close(b)
 
     def test_failed_reopen_after_recovery_recovers_later(self, db_path, monkeypatch, caplog):
         """A reopen that fails while the store is offline must not leave the
